@@ -1,0 +1,900 @@
+// Lala_Planar_Tactics_Assignments v3 - 2026-10-31, ANOMECH REHEARSAL COMPATIBILITY.
+// v3 adds an opt-in AnoMech rehearsal roster filter; normal live-duty behavior is unchanged.
+// Replaces v1 (same namespace/class/config and popup ID); do not run renamed duplicates.
+// Stage 1: confirmed original quotas + stack targets + eight mines lock starts/partners.
+// Stage 2: each fresh Planar rotation VFX fills that player's FACE, without moving routes.
+// Unknown facing is null, not a guessed cardinal. No facing arrows or live projection until known.
+// Preparation guides still disappear at march start. Missing facing then faults closed.
+// Entire file -> /splatoon -> Scripts -> Install from Clipboard.
+// SEPARATE Lala helper; keep Ketuduke helpers. Planar Tactics ONLY, not all Lala mechanics.
+// Player -> original mine quota -> start -> FACE before rotation -> named stack partner.
+// No input, auto-facing, movement, actions, chat, network, or waymark changes.
+// Normal-mode recorded patterns + a rotationally modeled fourth orientation.
+// Candidate: no clean recorded full-party success and no live plugin validation.
+// Coordinates: Lala center X=200, Y=-300, Z=0. North is -Z. NOT Ketuduke's grid.
+// Route offsets/rotation semantics: BMR PlanarTactics.cs; independent implementation.
+// Model assumes 4 units/s for 6 s, first-entry consumption of 8x8 mine squares.
+// See README and VALIDATION for evidence, assumptions, and test scope.
+#nullable enable
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Numerics;
+using System.Text;
+#if !PLANAR_CORE_ONLY
+using Dalamud.Bindings.ImGui;
+using Dalamud.Game.ClientState.Conditions;
+using Dalamud.Game.ClientState.Objects.SubKinds;
+using Dalamud.Game.ClientState.Objects.Types;
+using ECommons.DalamudServices;
+using ECommons.DalamudServices.Legacy;
+using ECommons.Hooks.ActionEffectTypes;
+using Splatoon;
+using Splatoon.SplatoonScripting;
+#endif
+
+namespace RaySplatoonScripts.Aloalo;
+
+#if !PLANAR_CORE_ONLY
+public class Lala_Planar_Tactics_Assignments : SplatoonScript
+{
+    public override Metadata Metadata => new(3, "Ray / ChatGPT");
+    public override HashSet<uint> ValidTerritories => new() {1179,1180};
+    private const uint Alpha=3724, Surge=3723, Times3=3721, Times5=3790, Forward=3715, Forced=3719;
+    private const string LeftVfx="vfx/lockon/eff/o5d1_angle90left_pc_e1.avfx";
+    private const string RightVfx="vfx/lockon/eff/o5d1_angle90right_pc_e1.avfx";
+    private static bool IsBoss(IGameObject a) => a.DataId==0x403E || a.DataId==0x40DC;
+    private static bool Planar(uint a) => a==34968 || a==35823;
+    private static bool MineCast(uint a) => a==34970 || a==35825;
+    private static bool StackEffect(uint a) => a==34974 || a==35829;
+    private static bool Failure(uint a) => a==34972 || a==34973 || a==35827 || a==35828;
+    private static bool NearLala(IGameObject a) => LalaPlanarCore.Finite(a.Position) &&
+        MathF.Abs(a.Position.X-200)<45 && MathF.Abs(a.Position.Z)<45 && MathF.Abs(a.Position.Y+300)<10;
+    private static long Now => Environment.TickCount64;
+    private Config C => Controller.GetConfig<Config>();
+    public class Config
+    {
+        public bool EnablePopup=true, LockPopup=false, ShowWaiting=true;
+        public bool ShowGroundGuides=true, ShowAllStarts=true, ShowMyLine=true, ShowOtherPlayerLines=true;
+        public bool ShowFaceArrows=true, ShowMarchPaths=false, ShowExpectedStackPoints=true;
+        public bool ShowMyLiveProjection=false, ShowCoordinates=false, EnableExperimentalSavage=false;
+        public bool EnableAnoMechRehearsalMode=false;
+        public string PreferredTwoPlayer="";
+        public bool ReverseEquivalentTwos=false;
+        public float FontScale=1.05f, LineThickness=2.5f;
+    }
+    private enum Phase {Idle,Reading,Locked,Marching,Fault,Finished}
+    private Phase _phase;
+    private bool Engaged => _phase!=Phase.Idle && _phase!=Phase.Finished;
+    private bool Preparing => _phase==Phase.Reading || _phase==Phase.Locked;
+    private sealed class SeenPlayer
+    {
+        public int Quota,Multiplier;
+        public bool Stack,ForwardSeen;
+        public long Due;
+    }
+    private readonly Dictionary<uint,SeenPlayer> _seen=new();
+    private readonly Dictionary<uint,uint> _icons=new();
+    private readonly Dictionary<uint,int> _liveCounts=new();
+    private readonly Dictionary<uint,LalaPlanarCore.Mine> _mines=new();
+    private readonly Dictionary<uint,uint> _polled=new();
+    private readonly Queue<string> _history=new();
+    private readonly HashSet<uint> _resolvedStacks=new();
+    private LalaPlanarCore.Plan? _plan;
+    private uint _bossId;
+    private long _began,_marchAt,_surgeAt,_missingSince,_stableAt,_nextObserve,_lastBegin,_positionsAt;
+    private readonly Dictionary<uint,long> _facingAt=new();
+    private int _sequence;
+    private bool _subscribed,_preview,_resetPosition,_reverse;
+    private string _preferred="",_candidate="",_why="Waiting for a fresh Planar Tactics cast.",_warning="";
+    private string _snapshot="No observations yet.",_previous="No previous sequence.",_lastObservation="",_checks="";
+    private int _previewRotation,_previewInput,_previewReadyFaces=4;
+    private static readonly uint FaceColour=0xFF33D9FF;
+    private static uint PairColour(int pair) => pair==0 ? 0xFFFFBB55u : 0xFFFF77DDu;
+
+    public override void OnSetup()
+    {
+        for(int i=0;i<4;i++)
+        {
+            foreach(var key in new[]{"Start","End","FaceLabel"})
+                Controller.RegisterElement(key+i,new Element(0){Enabled=false,radius=0.35f,Filled=false,thicc=4,
+                    overlayFScale=1.05f,overlayVOffset=0.65f,overlayBGColor=0xDD000000,overlayText="",tether=false});
+            foreach(var key in new[]{"PlayerLine","FaceShaft","FaceLeft","FaceRight","Path"})
+                Controller.RegisterElement(key+i,new Element(2){Enabled=false,radius=0,Filled=false,thicc=2.5f,tether=false,overlayText=""});
+        }
+        Controller.RegisterElement("LiveProjection",new Element(2){Enabled=false,radius=0,Filled=false,thicc=2,tether=false});
+    }
+    public override void OnEnable()
+    {if(!_subscribed){Svc.PluginInterface.UiBuilder.Draw+=DrawPopup;_subscribed=true;}}
+    public override void OnDisable()
+    {if(_subscribed){Svc.PluginInterface.UiBuilder.Draw-=DrawPopup;_subscribed=false;}OnReset();}
+    public override void OnReset()
+    {
+        if(_history.Count>0)_previous=Export();
+        HideGuides();_phase=Phase.Idle;_plan=null;_preview=false;
+        _seen.Clear();_icons.Clear();_liveCounts.Clear();_mines.Clear();_polled.Clear();_resolvedStacks.Clear();
+        _lastBegin=0;_positionsAt=0;_facingAt.Clear();_why="Waiting for a fresh Planar Tactics cast.";
+        // Keep the last history/snapshot for Copy diagnostics after a wipe.
+    }
+    private void Begin(IGameObject boss)
+    {
+        if(_lastBegin!=0 && Now-_lastBegin<8000)return; // duplicate callback/message/poll observations
+        _lastBegin=Now;
+        if(boss.DataId==0x40DC && !C.EnableExperimentalSavage)return;
+        if(_history.Count>0)_previous=Export();
+        HideGuides();_history.Clear();_seen.Clear();_icons.Clear();_liveCounts.Clear();_mines.Clear();_resolvedStacks.Clear();
+        _plan=null;_phase=Phase.Reading;_sequence++;_bossId=boss.EntityId;_began=Now;
+        _marchAt=0;_surgeAt=0;_missingSince=0;_stableAt=0;_nextObserve=0;_positionsAt=0;_facingAt.Clear();
+        _candidate="";_warning="";_lastObservation="";_preview=false;
+        _preferred=C.PreferredTwoPlayer;_reverse=C.ReverseEquivalentTwos;
+        _why="Waiting for 8 mines, four original mine quotas and 2 stack targets. Facing is filled separately when rotation arrives.";
+        Log("START Planar Tactics; priority frozen: preferred two-player='"+_preferred+"', reverse="+_reverse);
+    }
+    public override void OnStartingCast(uint source,uint castId)
+    {
+        var a=Svc.Objects.FirstOrDefault(x=>x.EntityId==source);
+        if(a==null || !NearLala(a))return;
+        if(IsBoss(a) && Planar(castId))Begin(a);
+        else if(Preparing && MineCast(castId))ObserveMine(a);
+        else if(IsBoss(a) && a.EntityId==_bossId && Engaged &&
+            (castId==34976 || castId==35831 || castId==34977 || castId==35832 || castId==34989 || castId==35844))
+            Finish("Next Lala mechanic began.");
+    }
+    public override void OnMessage(string message)
+    {
+        if(!message.Contains("(12639>34968)",StringComparison.Ordinal) &&
+           !message.Contains("(12639>35823)",StringComparison.Ordinal))return;
+        var boss=Svc.Objects.FirstOrDefault(a=>IsBoss(a)&&NearLala(a));
+        if(boss!=null)Begin(boss);
+    }
+    public override void OnVFXSpawn(uint target,string vfxPath)
+    {
+        if(!Preparing)return;
+        uint icon=vfxPath==RightVfx ? 493u : vfxPath==LeftVfx ? 494u : 0u;
+        if(icon==0)return;
+        // Only the exact player rotation VFX, within a fresh Planar sequence. No raw icon-offset guessing.
+        var pc=Svc.Objects.OfType<IPlayerCharacter>().FirstOrDefault(p=>p.EntityId==target);
+        if(pc==null || !NearLala(pc))return;
+        if(_icons.TryGetValue(target,out var old) && old!=icon){Fault("Contradictory rotation VFX for "+pc.Name);return;}
+        if(!_icons.ContainsKey(target)){_icons[target]=icon;Log("ROTATION "+pc.Name+" "+(icon==493?"CW":"CCW")+" via VFX");}
+    }
+    public override void OnActionEffectEvent(ActionEffectSet set)
+    {
+        if(!Engaged || set.Source==null || !NearLala(set.Source))return;
+        uint a=set.Action?.RowId ?? 0;
+        if(Failure(a)){Fault("Mine-failure explosion observed. Original plan retained; recover manually.");return;}
+        if(a==34971 || a==35826)
+        {
+            if(Preparing && (_plan==null || EarliestDue()==0 || EarliestDue()-Now>250))
+            {Fault("A mine was consumed before the planned march; the intact-grid solution is no longer valid.");return;}
+            Log("MINE consumed; source="+set.Source.EntityId.ToString("X8"));
+        }
+        if(StackEffect(a) && _marchAt>0)
+        {
+            _resolvedStacks.Add(set.Source.EntityId);
+            if(_surgeAt==0)_surgeAt=Now;
+            Log("STACK resolution effect "+a);
+        }
+    }
+    private void ObserveMine(IGameObject a)
+    {
+        if(!Preparing || _plan!=null || !NearLala(a))return;
+        // Recorded caster POSITION is the square centre. Cast LOC is its front edge (~Z-4): do not use it here.
+        var mine=new LalaPlanarCore.Mine(a.EntityId,a.Position);
+        if(!_mines.ContainsKey(a.EntityId))Log($"MINE {a.EntityId:X8} centre X={a.Position.X:F3} Y={a.Position.Y:F3} Z={a.Position.Z:F3}");
+        _mines[a.EntityId]=mine;
+    }
+    private IPlayerCharacter[] Roster()
+    {
+        var pcs=Svc.Party.Select(m=>m.GameObject).OfType<IPlayerCharacter>()
+            .GroupBy(p=>p.EntityId).Select(g=>g.First()).ToArray();
+        if(C.EnableAnoMechRehearsalMode)
+        {
+            var simulated=Svc.Objects.OfType<IPlayerCharacter>().Where(NearLala)
+                .GroupBy(p=>p.EntityId).Select(g=>g.First()).ToArray();
+            var chosen=SelectAnoMechQuartet(simulated);
+            if(chosen.Length==4)return chosen;
+        }
+        if(pcs.Length!=4 && Svc.Condition[ConditionFlag.DutyRecorderPlayback])
+        {
+            var replay=Svc.Objects.OfType<IPlayerCharacter>().Where(NearLala)
+                .GroupBy(p=>p.EntityId).Select(g=>g.First()).ToArray();
+            if(replay.Length==4)pcs=replay;
+        }
+        return pcs;
+    }
+    private IPlayerCharacter[] SelectAnoMechQuartet(IPlayerCharacter[] all)
+    {
+        var selected=new List<IPlayerCharacter>();
+        var self=BasePlayer;
+        if(self!=null && all.Any(p=>p.EntityId==self.EntityId))
+            selected.Add(all.First(p=>p.EntityId==self.EntityId));
+        bool Has(Func<uint,bool> f)=>selected.Any(p=>f(p.ClassJob.RowId));
+        IPlayerCharacter? Pick(Func<uint,bool> f,params uint[] preferred)
+        {
+            foreach(var j in preferred)
+            {
+                var p=all.FirstOrDefault(x=>x.ClassJob.RowId==j && selected.All(s=>s.EntityId!=x.EntityId));
+                if(p!=null)return p;
+            }
+            return all.FirstOrDefault(x=>f(x.ClassJob.RowId)&&selected.All(s=>s.EntityId!=x.EntityId));
+        }
+        if(!Has(IsTankJob) && Pick(IsTankJob,21,19,32,37) is { } tank)selected.Add(tank);
+        if(!Has(IsHealerJob) && Pick(IsHealerJob,28,40,24,33) is { } healer)selected.Add(healer);
+        while(selected.Count(p=>IsDpsJob(p.ClassJob.RowId))<2)
+        {
+            var next=Pick(IsDpsJob,31,23,38,42,25,27,35,34,39,41,22,30,20);
+            if(next==null)break;
+            selected.Add(next);
+        }
+        return selected.GroupBy(p=>p.EntityId).Select(g=>g.First()).Take(4).ToArray();
+    }
+    private static bool IsTankJob(uint j)=>j is 19 or 21 or 32 or 37;
+    private static bool IsHealerJob(uint j)=>j is 24 or 28 or 33 or 40;
+    private static bool IsDpsJob(uint j)=>j>0 && !IsTankJob(j) && !IsHealerJob(j);
+    private void PollBossAndMines()
+    {
+        var live=new HashSet<uint>();
+        foreach(var a in Svc.Objects.OfType<IBattleNpc>())
+        {
+            if(!NearLala(a)||!a.IsCasting)continue;
+            if(IsBoss(a))
+            {
+                live.Add(a.EntityId);
+                if(!_polled.TryGetValue(a.EntityId,out var old)||old!=a.CastActionId)
+                    OnStartingCast(a.EntityId,a.CastActionId);
+                _polled[a.EntityId]=a.CastActionId;
+            }
+            else if(Preparing && MineCast(a.CastActionId))ObserveMine(a);
+        }
+        foreach(var id in _polled.Keys.Where(k=>!live.Contains(k)).ToArray())_polled.Remove(id);
+    }
+    private long EarliestDue()
+    {
+        var ds=_seen.Values.Where(s=>s.ForwardSeen&&s.Due>0).Select(s=>s.Due).ToArray();
+        return ds.Length==0?0:ds.Min();
+    }
+    private LalaPlanarCore.Player[] ObservePlayers(IPlayerCharacter[] pcs)
+    {
+        var result=new List<LalaPlanarCore.Player>();
+        foreach(var pc in pcs)
+        {
+            if(!_seen.TryGetValue(pc.EntityId,out var seen))_seen[pc.EntityId]=seen=new SeenPlayer();
+            var ss=pc.StatusList.ToArray();
+            int remaining=ss.Where(s=>s.StatusId==Alpha).Select(s=>(int)s.Param).FirstOrDefault();
+            if(seen.Quota>0 && (!_liveCounts.TryGetValue(pc.EntityId,out var lastQuota)||lastQuota!=remaining))
+            { _liveCounts[pc.EntityId]=remaining; Log("REMAINING "+pc.Name+" alpha="+remaining+" dead="+pc.IsDead+" (0 means status absent; not necessarily success)"); }
+            if(Preparing && pc.IsDead && (seen.Quota>0 || seen.ForwardSeen))
+            {Fault("A player died after receiving mechanic debuffs. A raise cannot restore their original assignment.");return Array.Empty<LalaPlanarCore.Player>();}
+            if(Preparing && !pc.IsDead)
+            {
+                var quota=ss.Where(s=>s.StatusId==Alpha).Select(s=>(int)s.Param).FirstOrDefault();
+                if(quota>0 && seen.Quota==0){seen.Quota=quota;Log("QUOTA "+pc.Name+" initial="+quota);}
+                // Never overwrite a captured initial quota with its reduced value.
+                if(ss.Any(s=>s.StatusId==Surge)&&!seen.Stack)
+                {
+                    if(_plan!=null){Fault("New stack target contradicts the locked plan: "+pc.Name);return Array.Empty<LalaPlanarCore.Player>();}
+                    seen.Stack=true;Log("STACK TARGET "+pc.Name);
+                }
+                var three=ss.Any(s=>s.StatusId==Times3);var five=ss.Any(s=>s.StatusId==Times5);
+                if(three && five){Fault("Both multiplier statuses on "+pc.Name);return Array.Empty<LalaPlanarCore.Player>();}
+                int mult=three?3:five?5:0;
+                if(mult>0)
+                {
+                    if(seen.Multiplier!=0&&seen.Multiplier!=mult){Fault("Multiplier changed before march for "+pc.Name);return Array.Empty<LalaPlanarCore.Player>();}
+                    seen.Multiplier=mult;
+                }
+                var forward=ss.FirstOrDefault(s=>s.StatusId==Forward);
+                if(forward!=null && float.IsFinite(forward.RemainingTime) && forward.RemainingTime>0 && forward.RemainingTime<40)
+                {seen.ForwardSeen=true;seen.Due=Now+(long)(forward.RemainingTime*1000);}
+            }
+            result.Add(new LalaPlanarCore.Player(pc.EntityId,pc.Name.ToString(),pc.ClassJob.RowId,seen.Quota,
+                seen.Stack,seen.Multiplier,_icons.TryGetValue(pc.EntityId,out var icon)?icon:0,pc.IsDead));
+        }
+        return result.ToArray();
+    }
+    public override void OnUpdate()
+    {
+        try
+        {
+            PollBossAndMines();
+            if(!Engaged){HideGuides();return;}
+            if(Now-_began>45000){Finish("45-second safety timeout.");return;}
+            if(_surgeAt>0 && Now-_surgeAt>=300){Finish("Planar pair stacks resolved.");return;}
+            if(_phase==Phase.Fault){HideGuides();return;}
+            var pcs=Roster();
+            bool bossOK=Svc.Objects.Any(a=>a.EntityId==_bossId&&!a.IsDead&&NearLala(a));
+            bool rosterOK=pcs.Length==4 && (_plan==null || _plan.Rows.All(r=>pcs.Any(p=>p.EntityId==r.Player.Id)));
+            if(!bossOK || !rosterOK)
+            {
+                HideGuides();
+                if(_missingSince==0)_missingSince=Now;
+                _why="Boss or four-player roster unavailable; waiting without drawing guides.";
+                if(Now-_missingSince>1500 && _plan!=null)Fault("Locked participant/boss missing. No silent reassignment.");
+                return;
+            }
+            _missingSince=0;
+            bool forced=pcs.Any(p=>p.StatusList.Any(s=>s.StatusId==Forced));
+            var players=ObservePlayers(pcs);
+            if(_phase==Phase.Fault)return;
+            long due=EarliestDue();
+            if(forced || (due>0&&Now>=due))
+            {
+                if(_marchAt==0)
+                {
+                    _marchAt=Now;HideGuides();
+                    Log("MARCH START "+(forced?"ForcedMarch status":"ForwardMarch deadline"));
+                    foreach(var pc in pcs)Log($"ACTUAL START {pc.Name} X={pc.Position.X:F3} Z={pc.Position.Z:F3} facingRadians={pc.Rotation:F5}");
+                    if(_plan==null){Fault("Incomplete initial assignments before march. No late four-player solve.");return;}
+                    var pending=_plan.Rows.Where(r=>!r.Face.HasValue).Select(r=>r.Player.Name).ToArray();
+                    if(pending.Length>0)
+                    {Fault("March began without confirmed facing for: "+string.Join(", ",pending)+". Original positions retained; guides hidden. No guessed or late facing.");return;}
+                    _phase=Phase.Marching;
+                }
+            }
+            if(_plan!=null && pcs.Any(p=>p.IsDead))
+            {Fault("PLAYER DOWN: original assignments retained; movement guides hidden. Recover manually.");return;}
+            if(_phase==Phase.Reading)
+            {
+                bool timers=players.Length==4 && players.All(p=>_seen[p.Id].ForwardSeen);
+                if(!timers)_why="Waiting for all four Forward March statuses. Missing inputs will not be guessed.";
+                else if(due==0 || due-Now<1000)_why="Too late to issue a new starting assignment.";
+                else if(LalaPlanarCore.TryAssignPositions(players,_mines.Values.ToArray(),_preferred,_reverse,out var plan,out var reason))
+                {
+                    if(plan!.Signature!=_candidate){_candidate=plan.Signature;_stableAt=Now;}
+                    if(Now-_stableAt>=200)
+                    {
+                        _plan=plan;_phase=Phase.Locked;_why="";_positionsAt=Now;
+                        Log("POSITIONS LOCK missing corner="+plan!.MissingCorner+"; rotation is NOT required for this lock.");
+                        foreach(var r in plan.Rows)Log($"ASSIGN {r.Player.Name} quota={r.Player.Quota} marked={r.Player.Stack} {r.Route} start={LalaPlanarCore.XZ(r.Start)} FACE PENDING -> march {LalaPlanarCore.Cardinal(r.March)} end={LalaPlanarCore.XZ(r.End)} partner={r.PartnerName}");
+                    }
+                    else _why="Confirming stable starting positions and partners; rotation can arrive later...";
+                }
+                else {_candidate="";_why=reason;}
+            }
+            // Enrich the locked routes; NEVER solve/reassign them when icons arrive.
+            // This runs only before the deadline/ForcedMarch transition above.
+            if(_phase==Phase.Locked)
+            {
+                UpdateFacings(players);
+                if(_phase==Phase.Fault)return;
+            }
+            if(Now>=_nextObserve)
+            {
+                _nextObserve=Now+250;
+                _snapshot=$"phase={_phase}; mines={_mines.Count}; facingReady={(_plan==null?0:LalaPlanarCore.ReadyFaces(_plan))}/4; dueIn={(due==0?-1:(due-Now)/1000f):F2}s\n"+
+                    string.Join("\n",players.Select(p=>$"{p.Name}: originalQuota={p.Quota}, liveAlpha={(_liveCounts.TryGetValue(p.Id,out var current)?current:-1)}, marked={p.Stack}, x{p.Multiplier}, icon={p.Icon}, dead={p.Dead}"));
+                string observation=_phase+"|"+_mines.Count+"|"+string.Join(";",players.Select(p=>$"{p.Id}:{p.Quota}:{p.Stack}:{p.Multiplier}:{p.Icon}:{p.Dead}"))+"|"+_why;
+                if(observation!=_lastObservation){_lastObservation=observation;Log("OBS "+observation);}
+            }
+            if(_marchAt>0 && Now-_marchAt>10000){Finish("Post-march safety timeout; no stack resolution callback.");return;}
+            DrawGuides(pcs);
+        }
+        catch(Exception e){Fault("Helper error; copy diagnostics. "+e.GetType().Name+": "+e.Message);Log(e.StackTrace??"");}
+    }
+    private void UpdateFacings(LalaPlanarCore.Player[] players)
+    {
+        if(_plan==null || _phase!=Phase.Locked)return;
+        var before=_plan;
+        if(!LalaPlanarCore.TryEnrichFacings(before,players,out var updated,out var why))
+        {Fault("Locked plan input changed: "+why);return;}
+        _plan=updated!;
+        foreach(var row in _plan.Rows)
+        {
+            var prior=before.Rows.Single(r=>r.Player.Id==row.Player.Id);
+            if(!prior.Face.HasValue && row.Face.HasValue)
+            {
+                _facingAt[row.Player.Id]=Now;
+                Log($"FACING LOCK {row.Player.Name}: x{row.Player.Multiplier}, icon={row.Player.Icon}, FACE {LalaPlanarCore.FaceText(row)}; {((Now-_positionsAt)/1000f):F3}s after position lock. Route/partner unchanged.");
+            }
+        }
+    }
+    private void HideGuides()
+    {
+        for(int i=0;i<4;i++)foreach(var key in new[]{"Start","End","FaceLabel","PlayerLine","FaceShaft","FaceLeft","FaceRight","Path"})
+            if(Controller.TryGetElementByName(key+i,out var e))e.Enabled=false;
+        if(Controller.TryGetElementByName("LiveProjection",out var p))p.Enabled=false;
+    }
+    private void Point(string key,Vector3 p,float radius,uint colour,string text)
+    {
+        if(!Controller.TryGetElementByName(key,out var e))return;
+        e.refX=p.X;e.refY=p.Z;e.refZ=p.Y+0.06f;e.radius=radius;e.color=colour;
+        e.overlayTextColor=colour;e.overlayText=text;e.Enabled=true;e.tether=false;
+    }
+    private void Line(string key,Vector3 a,Vector3 b,uint colour,float width)
+    {
+        if(!Controller.TryGetElementByName(key,out var e))return;
+        e.refX=a.X;e.refY=a.Z;e.refZ=a.Y+0.06f;e.offX=b.X;e.offY=b.Z;e.offZ=b.Y+0.06f;
+        e.color=colour;e.thicc=Math.Clamp(width,1f,6f);e.Enabled=true;e.tether=false;
+    }
+    private void FaceArrow(int i,LalaPlanarCore.Row row)
+    {
+        if(row.Face is not Vector3 d)return;
+        var start=row.Start;var tip=start+d*3;
+        var side=new Vector3(-d.Z,0,d.X);
+        Line("FaceShaft"+i,start,tip,FaceColour,3);
+        Line("FaceLeft"+i,tip,tip-d*0.75f+side*0.45f,FaceColour,3);
+        Line("FaceRight"+i,tip,tip-d*0.75f-side*0.45f,FaceColour,3);
+        Point("FaceLabel"+i,tip,0,FaceColour,"FACE "+LalaPlanarCore.Cardinal(d));
+    }
+    private void DrawGuides(IPlayerCharacter[] pcs)
+    {
+        HideGuides();
+        if(!C.ShowGroundGuides || _plan==null || _phase==Phase.Fault || _missingSince!=0)return;
+        uint self=BasePlayer?.EntityId??0;
+        bool preparing=_phase==Phase.Locked;
+        for(int i=0;i<_plan.Rows.Length;i++)
+        {
+            var r=_plan.Rows[i];var pc=pcs.FirstOrDefault(p=>p.EntityId==r.Player.Id);
+            if(pc==null||pc.IsDead)continue;
+            bool own=r.Player.Id==self;
+            bool connection=own?C.ShowMyLine:C.ShowOtherPlayerLines;
+            bool show=own||C.ShowAllStarts||connection;
+            if(!show)continue;
+            uint colour=PairColour(r.Pair);
+            if(preparing)
+            {
+                Point("Start"+i,r.Start,0.3f,colour,$"START {r.Route}\n{r.Player.Name}\n{r.Player.Quota} mines | "+(r.Face.HasValue?"FACE "+LalaPlanarCore.FaceText(r):"FACE: waiting for rotation"));
+                if(connection)Line("PlayerLine"+i,pc.Position,r.Start,colour,C.LineThickness);
+                if(C.ShowFaceArrows && r.Face.HasValue)FaceArrow(i,r);
+                if(C.ShowMarchPaths)Line("Path"+i,r.Start,r.End,0x88FFFFFF,1.5f);
+            }
+            // Expected endpoints are reference rings only; never a live command to run back.
+            if(C.ShowExpectedStackPoints && (!preparing || C.ShowMarchPaths))
+                Point("End"+i,r.End,0.4f,colour,$"EXPECTED FINISH\n{r.Player.Name}\nwith {r.PartnerName}");
+            if(own && preparing && C.ShowMyLiveProjection && r.Face.HasValue)
+            {
+                var end=LalaPlanarCore.Project(pc.Position,pc.Rotation,r.Player.Multiplier,r.Player.Icon);
+                bool outside=!LalaPlanarCore.InBounds(end);
+                Line("LiveProjection",pc.Position,end,outside?0xFF4444FFu:0x99FFFFFFu,2);
+            }
+        }
+    }
+    private string Readiness(LalaPlanarCore.Row row,IPlayerCharacter? pc)
+    {
+        if(_phase==Phase.Fault)return "RECOVERY";
+        if(_phase==Phase.Marching)return "Original setup";
+        if(pc==null)return "Not visible";
+        if(pc.IsDead)return "DOWN";
+        float distance=LalaPlanarCore.Distance(pc.Position,row.Start);
+        if(row.Face is not Vector3 facing)
+            return distance>0.4f?"Move to START; facing pending":"At START; wait for rotation";
+        var end=LalaPlanarCore.Project(pc.Position,pc.Rotation,row.Player.Multiplier,row.Player.Icon);
+        if(!LalaPlanarCore.InBounds(end))return "MARCH OUTSIDE!";
+        float error=MathF.Abs(LalaPlanarCore.NormalizeAngle(pc.Rotation-MathF.Atan2(facing.X,facing.Z)))*180/MathF.PI;
+        if(distance>0.4f)return "Move to START";
+        if(error>2f)return "Turn: FACE "+LalaPlanarCore.FaceText(row);
+        return "Position + facing set";
+    }
+    private void DrawPopup()
+    {
+        bool preview=_preview && !Engaged && !Svc.Condition[ConditionFlag.InCombat];
+        if(!C.EnablePopup || (!preview&&(!Engaged||(_plan==null&&!C.ShowWaiting))))return;
+        var plan=preview?LalaPlanarCore.Preview(_previewRotation,_previewInput,_previewReadyFaces):_plan;
+        var flags=ImGuiWindowFlags.AlwaysAutoResize|ImGuiWindowFlags.NoCollapse|ImGuiWindowFlags.NoFocusOnAppearing|ImGuiWindowFlags.NoNav;
+        if(C.LockPopup&&!preview)flags|=ImGuiWindowFlags.NoMove|ImGuiWindowFlags.NoInputs;
+        var vp=ImGui.GetMainViewport();
+        ImGui.SetNextWindowPos(vp.Pos+new Vector2(vp.Size.X*0.5f,vp.Size.Y*0.16f),_resetPosition?ImGuiCond.Always:ImGuiCond.FirstUseEver,new Vector2(0.5f,0));
+        _resetPosition=false;ImGui.SetNextWindowBgAlpha(0.94f);
+        if(ImGui.Begin("Lala - Planar assignments###RayLalaPlanarV1",flags))
+        {
+            ImGui.SetWindowFontScale(Math.Clamp(C.FontScale,0.8f,2f));
+            ImGui.TextUnformatted(preview?"PREVIEW ONLY - SAMPLE PLAN":"PLANAR TACTICS - START, FACE, THEN PAIR STACK");
+            long due=EarliestDue();
+            if(!preview && _phase==Phase.Fault)ImGui.TextUnformatted("GUIDANCE WITHHELD - any table below is the original plan, not a recovery instruction.");
+            else if(!preview && Preparing && due>0)ImGui.TextUnformatted($"March in {Math.Max(0,(due-Now)/1000f):F1}s - FACE is the direction BEFORE the forced turn.");
+            else if(!preview && _phase==Phase.Marching)ImGui.TextUnformatted("MARCH ACTIVE / RESOLVING - original setup below. Do NOT return to starting circles.");
+            else ImGui.TextUnformatted("Go to the named START ring, then face the YELLOW arrow. Pair colours match partners.");
+            if(_warning.Length>0&&!preview)ImGui.TextColored(new Vector4(1,0.35f,0.3f,1),_warning);
+            if(plan==null)ImGui.TextWrapped(_why);
+            else
+            {
+                var pcs=preview?Array.Empty<IPlayerCharacter>():Roster();uint self=BasePlayer?.EntityId??0;
+                ImGui.TextUnformatted("Missing mine corner: "+plan.MissingCorner+". Route labels are NOT waymarks or floor-tile names.");
+                int ready=LalaPlanarCore.ReadyFaces(plan);
+                if(preview || Preparing)
+                {
+                    ImGui.TextUnformatted(ready<4
+                        ? $"STARTS + PARTNERS LOCKED | Facing confirmed: {ready}/4. Move to START; wait for your own FACE instruction."
+                        : "STARTS + PARTNERS LOCKED | All four FACE instructions confirmed.");
+                    if(ready<4)ImGui.TextUnformatted("March goes = the planned travel direction, NOT the direction to face before rotation.");
+                }
+                var mine=plan.Rows.FirstOrDefault(r=>r.Player.Id==self);
+                if(mine!=null&&!preview && Preparing)
+                    ImGui.TextColored(new Vector4(1,0.85f,0.2f,1),$"YOU: {mine.Route} | FACE {LalaPlanarCore.FaceText(mine)} | STACK WITH {mine.PartnerName}");
+                if(ImGui.BeginTable("LalaPlanarRows",7,ImGuiTableFlags.SizingFixedFit|ImGuiTableFlags.BordersInnerV))
+                {
+                    foreach(var h in new[]{"Player","Mines / stack","START marker","FACE before","March goes","STACK with","Live check"})ImGui.TableSetupColumn(h);
+                    ImGui.TableHeadersRow();
+                    foreach(var r in plan.Rows)
+                    {
+                        var colour=r.Pair==0?new Vector4(0.33f,0.73f,1,1):new Vector4(0.87f,0.47f,1,1);
+                        ImGui.TableNextRow();ImGui.TableSetColumnIndex(0);ImGui.TextUnformatted((!preview&&r.Player.Id==self?"> ":"")+r.Player.Name);
+                        ImGui.TableSetColumnIndex(1);ImGui.TextUnformatted(r.Player.Quota+" / "+(r.Player.Stack?"MARKED":"unmarked"));
+                        ImGui.TableSetColumnIndex(2);ImGui.TextColored(colour,r.Route);
+                        if(C.ShowCoordinates)ImGui.TextUnformatted(LalaPlanarCore.XZ(r.Start));
+                        ImGui.TableSetColumnIndex(3);ImGui.TextColored(new Vector4(1,0.85f,0.2f,1),LalaPlanarCore.FaceText(r));
+                        ImGui.TableSetColumnIndex(4);ImGui.TextUnformatted(LalaPlanarCore.Cardinal(r.March));
+                        ImGui.TableSetColumnIndex(5);ImGui.TextColored(colour,r.PartnerName);
+                        ImGui.TableSetColumnIndex(6);ImGui.TextUnformatted(preview?"Sample":Readiness(r,pcs.FirstOrDefault(p=>p.EntityId==r.Player.Id)));
+                    }
+                    ImGui.EndTable();
+                }
+                ImGui.TextUnformatted("Mines = ORIGINAL quota. Counts decreasing never reshuffle this plan.");
+                ImGui.TextUnformatted("Start lines identify destinations, not safe approach paths. Do not enter mines before forced march.");
+                ImGui.TextUnformatted("Yellow arrow = required FACE. White path, when enabled = expected MARCH (different direction).");
+            }
+            ImGui.SetWindowFontScale(1);
+        }
+        ImGui.End();
+    }
+    public override void OnSettingsDraw()
+    {
+        ImGui.TextWrapped("Lala Planar Tactics v3: early starts, per-player facing, AnoMech rehearsal support. SEPARATE helper: only mine/forced-march/pair stacks. Does not replace Ketuduke helpers or cover other Lala mechanics.");
+        ImGui.TextWrapped("Confirmed quotas, stack targets and eight mines lock positions first. Rotation VFX fills each FACE later; starts and partners never reshuffle. Unknown faces are not drawn or guessed.");
+        var changed=ImGui.Checkbox("Enable popup",ref C.EnablePopup);
+        changed|=ImGui.Checkbox("Lock popup / click through",ref C.LockPopup);
+        changed|=ImGui.Checkbox("Show waiting and unresolved information",ref C.ShowWaiting);
+        changed|=ImGui.Checkbox("Show ground guides",ref C.ShowGroundGuides);
+        changed|=ImGui.Checkbox("Show ALL players' start markers",ref C.ShowAllStarts);
+        changed|=ImGui.Checkbox("Line from me to my START",ref C.ShowMyLine);
+        changed|=ImGui.Checkbox("Lines from OTHER players to their STARTS",ref C.ShowOtherPlayerLines);
+        changed|=ImGui.Checkbox("Yellow required-FACE arrows",ref C.ShowFaceArrows);
+        changed|=ImGui.Checkbox("Show fixed expected MARCH paths (white)",ref C.ShowMarchPaths);
+        changed|=ImGui.Checkbox("Expected stack endpoint rings during march",ref C.ShowExpectedStackPoints);
+        changed|=ImGui.Checkbox("Show my LIVE march projection before march",ref C.ShowMyLiveProjection);
+        changed|=ImGui.Checkbox("Show world X/Z coordinates",ref C.ShowCoordinates);
+        changed|=ImGui.SliderFloat("Popup text scale",ref C.FontScale,0.8f,2f);
+        changed|=ImGui.SliderFloat("Player-line thickness",ref C.LineThickness,1,6);
+        ImGui.Separator();
+        ImGui.TextWrapped("Only when BOTH two-mine routes are equally valid: choose who gets TWO-A (partner of the one-mine player). Other cases are fixed by stack targets.");
+        if(ImGui.BeginCombo("Equivalent TWO-A priority",C.PreferredTwoPlayer.Length==0?"Auto: Tank > MCH > PCT > Healer > others":C.PreferredTwoPlayer))
+        {
+            if(ImGui.Selectable("Auto: Tank > MCH > PCT > Healer > others",C.PreferredTwoPlayer.Length==0)){C.PreferredTwoPlayer="";changed=true;}
+            foreach(var name in Roster().Select(p=>p.Name.ToString()).Distinct().OrderBy(n=>n,StringComparer.Ordinal))
+                if(ImGui.Selectable(name,C.PreferredTwoPlayer==name)){C.PreferredTwoPlayer=name;changed=true;}
+            ImGui.EndCombo();
+        }
+        changed|=ImGui.Checkbox("Reverse equivalent two-player choice",ref C.ReverseEquivalentTwos);
+        ImGui.TextWrapped("Priority is frozen at Planar Tactics start. Use the same setting on every client using this helper. It never overrides a required marked/unmarked pairing.");
+        changed|=ImGui.Checkbox("Enable EXPERIMENTAL Savage (no recorded validation)",ref C.EnableExperimentalSavage);
+        changed|=ImGui.Checkbox("ANOMECH REHEARSAL MODE (8-player sim -> 4-player Lala quartet)",ref C.EnableAnoMechRehearsalMode);
+        if(C.EnableAnoMechRehearsalMode)ImGui.TextWrapped("TEST ONLY: selects the local player plus one tank, one healer and two DPS from AnoMech's simulated roster. Turn this OFF for the real duty.");
+        ImGui.Separator();
+        ImGui.Checkbox("Preview TEXT only (no world guides)",ref _preview);
+        if(_preview)
+        {
+            ImGui.SliderInt("Preview rotation: 0 SW, 1 NW, 2 NE, 3 SE",ref _previewRotation,0,3);
+            ImGui.SliderInt("Preview input: 0 x3 CW, 1 x3 CCW, 2 x5 CW, 3 x5 CCW",ref _previewInput,0,3);
+            ImGui.SliderInt("Preview confirmed faces: 0 = early plan, 4 = complete",ref _previewReadyFaces,0,4);
+        }
+        if(ImGui.Button("Reset popup position"))_resetPosition=true;
+        ImGui.SameLine();if(ImGui.Button("Run assignment / geometry self-checks"))_checks=LalaPlanarCore.RunChecks();
+        if(ImGui.Button("Run EARLY POSITION / staged-facing self-checks"))_checks=LalaPlanarCore.RunEarlyChecks();
+        if(_checks.Length>0)ImGui.TextWrapped(_checks);
+        if(ImGui.Button("Copy diagnostics"))ImGui.SetClipboardText(Export()+"\n\nPREVIOUS SEQUENCE\n"+_previous);
+        ImGui.SameLine();if(ImGui.Button("Hide until next Planar Tactics"))Finish("Manually hidden.");
+        ImGui.TextUnformatted("Phase="+_phase+"; sequence="+_sequence);
+        ImGui.TextWrapped("Enable before Planar Tactics. A missing/dead/debuff-less player is NOT replaced. Initial quotas and partners remain fixed through mine consumption. This build does not automate facing or movement.");
+        if(ImGui.CollapsingHeader("Diagnostics"))ImGui.TextUnformatted(Export());
+        if(changed)Controller.SaveConfig();
+        if(!IsEnabled&&_preview)DrawPopup();
+    }
+    private void Fault(string why)
+    {if(_phase==Phase.Fault)return;_warning=why;_phase=Phase.Fault;HideGuides();Log("FAULT "+why);}
+    private void Finish(string why)
+    {Log("FINISH "+why);_phase=Phase.Finished;HideGuides();}
+    private void Log(string text)
+    {_history.Enqueue($"{DateTime.UtcNow:O} | +{(_began==0?0:(Now-_began)/1000f):F3}s | {text}");while(_history.Count>500)_history.Dequeue();}
+    private string Export()
+    {
+        var sb=new StringBuilder("Lala_Planar_Tactics_Assignments v3 - early positions / staged facing / AnoMech rehearsal\n");
+        sb.AppendLine($"phase={_phase}; sequence={_sequence}; reason={_why}; warning={_warning}");
+        sb.AppendLine($"preferredTwo='{_preferred}'; reverse={_reverse}; icons are exact CW/CCW VFX, not guessed raw icon offsets.");
+        sb.AppendLine($"positionLockAfterCast={(_positionsAt==0?-1:(_positionsAt-_began)/1000f):F3}s; facingReady={(_plan==null?0:LalaPlanarCore.ReadyFaces(_plan))}/4");
+        foreach(var kv in _facingAt)sb.AppendLine($"facingPlayer={kv.Key:X8}; positionHeadStart={(kv.Value-_positionsAt)/1000f:F3}s");
+        sb.AppendLine(_snapshot);
+        if(_plan!=null)foreach(var r in _plan.Rows)
+            sb.AppendLine($"LOCKED {r.Player.Name} quota={r.Player.Quota} stack={r.Player.Stack} x{r.Player.Multiplier} icon={r.Player.Icon}: {r.Route} {LalaPlanarCore.XZ(r.Start)} FACE {LalaPlanarCore.FaceText(r)} -> {LalaPlanarCore.XZ(r.End)}; partner={r.PartnerName}");
+        sb.AppendLine("EVENT HISTORY\n"+string.Join("\n",_history));return sb.ToString();
+    }
+}
+#endif
+
+// Pure solver: no plugin, IO, hooks, or user-input APIs.
+// Route constants reproduce the documented/BMR strategy; pairing and validation are explicit.
+public static class LalaPlanarCore
+{
+    public static readonly Vector3 Centre=new(200,-300,0);
+    public const float MarchDistance=24,Speed=4,Duration=6,StackRadius=6;
+    public sealed record Player(uint Id,string Name,uint Job,int Quota,bool Stack,int Multiplier,uint Icon,bool Dead);
+    public sealed record Mine(uint Id,Vector3 Position);
+    public sealed record Row(Player Player,string Route,int Pair,Vector3 Start,Vector3 End,Vector3 March,Vector3? Face,uint PartnerId,string PartnerName);
+    public sealed record Plan(string MissingCorner,int Rotation,Row[] Rows,string Signature);
+    private static readonly string[] RouteNames={"ONE","TWO-A","TWO-B","THREE"};
+    private static readonly Vector3[] Starts={new(-13,0,5),new(-13,0,3),new(-16,0,-8),new(8,0,13)};
+    private static readonly Vector3[] Marches={new(1,0,0),new(1,0,0),new(1,0,0),new(0,0,-1)};
+    private static readonly int[] Quotas={1,2,2,3};
+    private static readonly int[] PartnerRoutes={1,0,3,2};
+    public static bool Finite(Vector3 p)=>float.IsFinite(p.X)&&float.IsFinite(p.Y)&&float.IsFinite(p.Z);
+    public static float Distance(Vector3 a,Vector3 b)=>MathF.Sqrt((a.X-b.X)*(a.X-b.X)+(a.Z-b.Z)*(a.Z-b.Z));
+    public static bool InBounds(Vector3 p)=>Finite(p)&&MathF.Abs(p.X-200)<19.5f&&MathF.Abs(p.Z)<19.5f;
+    public static string XZ(Vector3 p)=>$"X {p.X:F2}, Z {p.Z:F2}";
+    public static Vector3 Rotate(Vector3 p,int n)
+    {for(int i=0;i<((n%4)+4)%4;i++)p=new Vector3(-p.Z,p.Y,p.X);return p;}
+    public static float NormalizeAngle(float x)=>MathF.Atan2(MathF.Sin(x),MathF.Cos(x));
+    public static float Delta(int multiplier,uint icon)
+    {
+        if((multiplier!=3&&multiplier!=5)||(icon!=493&&icon!=494))throw new ArgumentException("Missing multiplier/rotation input.");
+        return (icon==494?1f:-1f)*(multiplier==3?-1f:1f)*MathF.PI/2;
+    }
+    public static Vector3 Facing(Vector3 march,int multiplier,uint icon)
+    {
+        float a=MathF.Atan2(march.X,march.Z)-Delta(multiplier,icon);
+        return new Vector3(MathF.Round(MathF.Sin(a)),0,MathF.Round(MathF.Cos(a)));
+    }
+    public static Vector3 Project(Vector3 start,float currentFacing,int multiplier,uint icon)
+    {float a=currentFacing+Delta(multiplier,icon);return start+new Vector3(MathF.Sin(a),0,MathF.Cos(a))*MarchDistance;}
+    public static string Cardinal(Vector3 d)=>!Finite(d) || d.X*d.X+d.Z*d.Z<0.5f?"UNKNOWN":
+        MathF.Abs(d.X)>MathF.Abs(d.Z)?(d.X>0?"EAST":"WEST"):(d.Z>0?"SOUTH":"NORTH");
+    public static string FaceText(Row row)=>row.Face is Vector3 d?Cardinal(d):"WAITING FOR ROTATION";
+    public static int ReadyFaces(Plan plan)=>plan.Rows.Count(r=>r.Face.HasValue);
+    private static int Rank(uint job)=>job is 19 or 21 or 32 or 37?0:job==31?1:job==42?2:job is 24 or 28 or 33 or 40?3:4;
+    public static bool TryPattern(Mine[] mines,out int rotation,out string reason)
+    {
+        rotation=0;reason="";
+        if(mines.Length!=8||mines.Select(m=>m.Id).Distinct().Count()!=8){reason=$"Need 8 distinct mine casters (have {mines.Length}).";return false;}
+        var cells=new HashSet<(int x,int z)>();
+        foreach(var m in mines)
+        {
+            var p=m.Position-Centre;
+            if(!Finite(m.Position)||MathF.Abs(p.Y)>3){reason="Invalid mine height/coordinates.";return false;}
+            int x=(int)MathF.Round(p.X/8),z=(int)MathF.Round(p.Z/8);
+            if(x< -1||x>1||z< -1||z>1||MathF.Abs(p.X-x*8)>0.6f||MathF.Abs(p.Z-z*8)>0.6f||!cells.Add((x,z)))
+            {reason="Mine centres are not eight unique squares of the expected grid. No guessed orientation.";return false;}
+        }
+        var missing=new List<(int x,int z)>();
+        for(int x=-1;x<=1;x++)for(int z=-1;z<=1;z++)if(!cells.Contains((x,z)))missing.Add((x,z));
+        if(missing.Count!=1||Math.Abs(missing[0].x)!=1||Math.Abs(missing[0].z)!=1)
+        {reason="Expected one missing CORNER in the central 3x3 mine grid.";return false;}
+        for(int n=0;n<4;n++)
+        {
+            var p=Rotate(new Vector3(-8,0,8),n);
+            if(p.X==missing[0].x*8 && p.Z==missing[0].z*8){rotation=n;return true;}
+        }
+        reason="Unrecognized corner.";return false;
+    }
+    // Orientation is intentionally NOT a prerequisite for confirmed route ownership.
+    // The returned routes contain unknown FACE values even if rotation inputs already exist.
+    public static bool TryAssignPositions(Player[] players,Mine[] mines,string preferredTwo,bool reverse,out Plan? plan,out string reason)
+    {
+        plan=null;reason="";
+        if(players.Length!=4||players.Select(p=>p.Id).Distinct().Count()!=4){reason="Need four distinct players.";return false;}
+        if(players.Any(p=>p.Dead)){reason="A player is dead; no complete initial plan issued.";return false;}
+        if(!players.Select(p=>p.Quota).OrderBy(q=>q).SequenceEqual(new[]{1,2,2,3}))
+        {reason="Waiting for ORIGINAL mine quotas 1 / 2 / 2 / 3. Do not infer missing debuffs.";return false;}
+        if(players.Count(p=>p.Stack)!=2){reason="Waiting for exactly two Surge Vector stack targets.";return false;}
+        if(!TryPattern(mines,out int n,out reason))return false;
+        var one=players.Single(p=>p.Quota==1);var three=players.Single(p=>p.Quota==3);
+        var twos=players.Where(p=>p.Quota==2).OrderBy(p=>p.Name.Equals(preferredTwo,StringComparison.OrdinalIgnoreCase)?0:1)
+            .ThenBy(p=>Rank(p.Job)).ThenBy(p=>p.Name,StringComparer.Ordinal).ThenBy(p=>p.Id).ToArray();
+        var choices=new List<Player[]>();
+        foreach(var a in twos)
+        {
+            var b=twos.Single(p=>p.Id!=a.Id);
+            if(one.Stack!=a.Stack && three.Stack!=b.Stack)choices.Add(new[]{one,a,b,three});
+        }
+        if(choices.Count==0){reason="No valid marked/unmarked stack pairing.";return false;}
+        var owners=choices[reverse?choices.Count-1:0];
+        var rows=new Row[4];
+        for(int i=0;i<4;i++)
+        {
+            Vector3 start=Centre+Rotate(Starts[i],n),dir=Rotate(Marches[i],n),end=start+MarchDistance*dir;
+            var p=owners[i];var partner=owners[PartnerRoutes[i]];
+            rows[i]=new Row(p with{Multiplier=0,Icon=0},RouteNames[i],i<2?0:1,start,end,dir,null,partner.Id,partner.Name);
+        }
+        if(!CheckGeometry(rows,mines,out reason))return false;
+        var sorted=rows.OrderBy(r=>Rank(r.Player.Job)).ThenBy(r=>r.Player.Name,StringComparer.Ordinal).ThenBy(r=>r.Player.Id).ToArray();
+        string corner=new[]{"SW","NW","NE","SE"}[n];
+        string signature=n+"|"+string.Join("|",sorted.Select(r=>$"{r.Player.Id}:{r.Player.Quota}:{r.Player.Stack}:{r.Route}:{r.PartnerId}"));
+        plan=new Plan(corner,n,sorted,signature);return true;
+    }
+    // Add each player's observed orientation to a locked plan; never recompute its routes.
+    // Incoming quotas are the REMEMBERED ORIGINAL quotas, not the decreasing live counters.
+    // A temporarily missing rotation input preserves a previously confirmed one.
+    public static bool TryEnrichFacings(Plan locked,Player[] observed,out Plan? updated,out string reason)
+    {
+        updated=null;reason="";
+        if(observed.Length!=4 || observed.Select(p=>p.Id).Distinct().Count()!=4 ||
+            locked.Rows.Length!=4 || !locked.Rows.Select(r=>r.Player.Id).ToHashSet().SetEquals(observed.Select(p=>p.Id)))
+        {reason="Locked roster differs from the current four-player roster.";return false;}
+        var rows=new Row[locked.Rows.Length];
+        for(int i=0;i<locked.Rows.Length;i++)
+        {
+            var row=locked.Rows[i];var prior=row.Player;var next=observed.Single(p=>p.Id==prior.Id);
+            if(next.Dead){reason="A locked player is dead: "+prior.Name;return false;}
+            if(next.Quota!=prior.Quota || next.Stack!=prior.Stack || next.Job!=prior.Job || next.Name!=prior.Name)
+            {reason="Original quota/stack/player identity changed for "+prior.Name;return false;}
+            if((next.Multiplier!=0 && next.Multiplier!=3 && next.Multiplier!=5) ||
+               (next.Icon!=0 && next.Icon!=493 && next.Icon!=494))
+            {reason="Invalid multiplier/rotation input for "+prior.Name;return false;}
+            if((prior.Multiplier!=0 && next.Multiplier!=0 && prior.Multiplier!=next.Multiplier) ||
+               (prior.Icon!=0 && next.Icon!=0 && prior.Icon!=next.Icon))
+            {reason="Conflicting confirmed rotation for "+prior.Name;return false;}
+            var player=prior with{Multiplier=next.Multiplier!=0?next.Multiplier:prior.Multiplier,
+                Icon=next.Icon!=0?next.Icon:prior.Icon};
+            Vector3? face=player.Multiplier!=0 && player.Icon!=0?Facing(row.March,player.Multiplier,player.Icon):null;
+            if(row.Face.HasValue && (!face.HasValue || Distance(row.Face.Value,face.Value)>0.001f))
+            {reason="Confirmed facing would change for "+prior.Name;return false;}
+            rows[i]=row with{Player=player,Face=face};
+        }
+        // Signature excludes rotation so an arriving icon can never reset position stability.
+        updated=locked with{Rows=rows};return true;
+    }
+    // Compatibility entry point for tests/consumers needing a COMPLETE facing solution.
+    public static bool TrySolve(Player[] players,Mine[] mines,string preferredTwo,bool reverse,out Plan? plan,out string reason)
+    {
+        plan=null;
+        if(!TryAssignPositions(players,mines,preferredTwo,reverse,out var positions,out reason))return false;
+        if(!TryEnrichFacings(positions!,players,out var completed,out reason))return false;
+        if(ReadyFaces(completed!)!=4)
+        {reason="Waiting for every player's x3/x5 and CW/CCW player rotation VFX.";return false;}
+        plan=completed;return true;
+    }
+    public static float? Entry(Vector3 start,Vector3 direction,Vector3 mine)
+    {
+        float lo=0,hi=Duration;
+        foreach(var (p,v,c) in new[]{(start.X,direction.X*Speed,mine.X),(start.Z,direction.Z*Speed,mine.Z)})
+        {
+            if(MathF.Abs(v)<0.0001f){if(MathF.Abs(p-c)>4)return null;}
+            else
+            {
+                float a=(c-4-p)/v,b=(c+4-p)/v;
+                lo=MathF.Max(lo,MathF.Min(a,b));hi=MathF.Min(hi,MathF.Max(a,b));
+            }
+        }
+        return hi<lo?null:lo;
+    }
+    public static bool CheckGeometry(Row[] rows,Mine[] mines,out string reason)
+    {
+        reason="";var counts=rows.ToDictionary(r=>r.Player.Id,_=>0);
+        foreach(var mine in mines)
+        {
+            var contacts=rows.Select(r=>(Row:r,At:Entry(r.Start,r.March,mine.Position)))
+                .Where(x=>x.At.HasValue).OrderBy(x=>x.At!.Value).ToArray();
+            if(contacts.Length==0){reason="A mine would be uncleared in the geometric model.";return false;}
+            if(contacts.Length>1 && contacts[1].At!.Value-contacts[0].At!.Value<0.1f)
+            {reason="Ambiguous first mine contact.";return false;}
+            counts[contacts[0].Row.Player.Id]++;
+        }
+        foreach(var r in rows)
+        {
+            if(counts[r.Player.Id]!=r.Player.Quota||!InBounds(r.Start)||!InBounds(r.End))
+            {reason="Route quota or arena-boundary validation failed.";return false;}
+            var mate=rows.Single(x=>x.Player.Id==r.PartnerId);
+            if(r.Player.Stack==mate.Player.Stack||Distance(r.End,mate.End)>=StackRadius-0.5f)
+            {reason="Final stack pair validation failed.";return false;}
+            if(rows.Any(x=>x.Pair!=r.Pair&&Distance(x.End,r.End)<=StackRadius+0.5f))
+            {reason="Final stack pairs overlap.";return false;}
+        }
+        return true;
+    }
+    public static Mine[] TestMines(int n)
+    {
+        var m=new List<Mine>();uint id=100;
+        for(int x=-8;x<=8;x+=8)for(int z=-8;z<=8;z+=8)
+            if(x!=-8||z!=8)m.Add(new Mine(id++,Centre+Rotate(new Vector3(x,0,z),n)));
+        return m.ToArray();
+    }
+    public static Plan Preview(int n,int input,int readyFaces=4)
+    {
+        int mult=input<2?3:5;uint icon=input%2==0?493u:494u;
+        var p=new[]{new Player(1,"Tank player",21,3,false,mult,icon,false),new Player(2,"MCH player",31,2,false,mult,icon,false),
+            new Player(3,"PCT player",42,1,true,mult,icon,false),new Player(4,"Healer player",28,2,true,mult,icon,false)};
+        if(!TryAssignPositions(p,TestMines(n),"",false,out var positions,out var why))throw new InvalidOperationException(why);
+        var known=positions!.Rows.Take(Math.Clamp(readyFaces,0,4)).Select(r=>r.Player.Id).ToHashSet();
+        var available=p.Select(x=>known.Contains(x.Id)?x:x with{Icon=0}).ToArray();
+        if(!TryEnrichFacings(positions,available,out var plan,out why))throw new InvalidOperationException(why);
+        return plan!;
+    }
+    public static string RunChecks()
+    {
+        try
+        {
+            int count=0;
+            for(int n=0;n<4;n++)for(int one=0;one<4;one++)for(int three=0;three<4;three++)
+            {
+                if(one==three)continue;
+                for(int a=0;a<4;a++)for(int b=a+1;b<4;b++)for(int input=0;input<4;input++)for(int rev=0;rev<2;rev++)
+                {
+                    var jobs=new uint[]{21,31,42,28};
+                    var p=Enumerable.Range(0,4).Select(i=>new Player((uint)(i+1),"Player "+i,jobs[i],i==one?1:i==three?3:2,i==a||i==b,
+                        input<2?3:5,input%2==0?493u:494u,false)).ToArray();
+                    Require(TrySolve(p,TestMines(n),"",rev==1,out var plan,out var why),why);
+                    Require(TrySolve(p.Reverse().ToArray(),TestMines(n).Reverse().ToArray(),"",rev==1,out var reordered,out why),why);
+                    Require(plan!.Signature==reordered!.Signature,"Enumeration order changed assignment.");
+                    foreach(var r in plan.Rows)
+                    {
+                        float face=MathF.Atan2(r.Face!.Value.X,r.Face.Value.Z);
+                        Require(Distance(Project(r.Start,face,r.Player.Multiplier,r.Player.Icon),r.End)<0.001f,"Rotation inverse mismatch.");
+                    }
+                    count++;
+                }
+            }
+            var sample=Preview(0,3);var players=sample.Rows.Select(r=>r.Player).ToArray();
+            Require(!TrySolve(players.Take(3).ToArray(),TestMines(0),"",false,out _,out _),"Missing player accepted.");
+            var bad=players.ToArray();bad[0]=bad[0] with{Quota=0};Require(!TrySolve(bad,TestMines(0),"",false,out _,out _),"Missing quota accepted.");
+            bad=players.ToArray();bad[0]=bad[0] with{Icon=0};Require(!TrySolve(bad,TestMines(0),"",false,out _,out _),"Missing rotation accepted.");
+            bad=players.ToArray();bad[0]=bad[0] with{Dead=true};Require(!TrySolve(bad,TestMines(0),"",false,out _,out _),"Death accepted.");
+            Require(!TrySolve(players,TestMines(0).Take(7).ToArray(),"",false,out _,out _),"Partial grid accepted.");
+            var mines=TestMines(0);mines[0]=mines[0] with{Position=Centre};Require(!TrySolve(players,mines,"",false,out _,out _),"Duplicate mine cell accepted.");
+            Require(FaceText(Preview(0,3).Rows.Single(r=>r.Player.Job==21))=="EAST","Recorded-case tank facing regression.");
+            return $"PASS: {count} synthetic orientation/quota/stack/rotation/priority cases, reversed input order and invalid inputs. This does NOT test live APIs, event delivery, latency or a full successful pull.";
+        }
+        catch(Exception e){return "FAIL: "+e.Message;}
+    }
+    public static string RunEarlyChecks()
+    {
+        try
+        {
+            int partial=0,sequences=0;
+            for(int n=0;n<4;n++)for(int input=0;input<4;input++)
+            {
+                var full=Preview(n,input);var observed=full.Rows.Select(r=>r.Player).ToArray();
+                var noRotation=observed.Select(p=>p with{Multiplier=0,Icon=0}).ToArray();
+                Require(TryAssignPositions(noRotation,TestMines(n),"",false,out var positions,out var why),why);
+                Require(ReadyFaces(positions!)==0,"Unknown FACE was filled.");
+                Require(positions!.Rows.All(r=>FaceText(r)=="WAITING FOR ROTATION"),"Unknown FACE display regression.");
+                foreach(var row in positions.Rows)
+                {
+                    var expected=full.Rows.Single(r=>r.Player.Id==row.Player.Id);
+                    Require(row.Start==expected.Start && row.End==expected.End && row.March==expected.March &&
+                        row.Route==expected.Route && row.PartnerId==expected.PartnerId && row.Pair==expected.Pair,"Early route differs from full solve.");
+                }
+                for(int mask=0;mask<16;mask++)
+                {
+                    var subset=observed.Select((p,i)=>(mask&(1<<i))!=0?p:p with{Icon=0}).ToArray();
+                    Require(TryEnrichFacings(positions,subset,out var enriched,out why),why);
+                    Require(enriched!.Signature==positions.Signature,"Facing changed route signature.");
+                    Require(ReadyFaces(enriched)==System.Numerics.BitOperations.PopCount((uint)mask),"Partial ready count mismatch.");
+                    foreach(var row in enriched.Rows)
+                    {
+                        var expected=full.Rows.Single(r=>r.Player.Id==row.Player.Id);
+                        Require(row.Start==expected.Start && row.End==expected.End && row.March==expected.March &&
+                            row.Route==expected.Route && row.PartnerId==expected.PartnerId,"Facing reshuffled a route.");
+                        if(row.Face.HasValue)Require(Distance(row.Face.Value,expected.Face!.Value)<0.001f,"Wrong partial facing.");
+                    }
+                    partial++;
+                }
+                // Deliver four individual arrows in reverse roster order, not simultaneously.
+                var live=noRotation.ToArray();var locked=positions;
+                for(int i=3;i>=0;i--)
+                {
+                    live[i]=observed[i];
+                    Require(TryEnrichFacings(locked,live,out var next,out why),why);
+                    locked=next!;Require(ReadyFaces(locked)==4-i,"Incremental facing count mismatch.");
+                    Require(locked.Signature==positions.Signature,"Incremental arrival changed route lock.");
+                }
+                Require(TryEnrichFacings(locked,noRotation,out var retained,out why),why);
+                Require(ReadyFaces(retained!)==4,"Loss of a live rotation input erased remembered facing.");
+                var conflict=observed.ToArray();conflict[0]=conflict[0] with{Icon=observed[0].Icon==493?494u:493u};
+                Require(!TryEnrichFacings(locked,conflict,out _,out _),"Conflicting icon accepted.");
+                conflict=observed.ToArray();conflict[0]=conflict[0] with{Multiplier=observed[0].Multiplier==3?5:3};
+                Require(!TryEnrichFacings(locked,conflict,out _,out _),"Conflicting multiplier accepted.");
+                conflict=observed.ToArray();conflict[0]=conflict[0] with{Quota=0};
+                Require(!TryEnrichFacings(locked,conflict,out _,out _),"Changed original quota accepted.");
+                conflict=observed.ToArray();conflict[0]=conflict[0] with{Stack=!conflict[0].Stack};
+                Require(!TryEnrichFacings(locked,conflict,out _,out _),"Changed stack target accepted.");
+                conflict=observed.ToArray();conflict[0]=conflict[0] with{Dead=true};
+                Require(!TryEnrichFacings(positions,conflict,out _,out _),"Death accepted during enrichment.");
+                Require(!TryEnrichFacings(positions,observed.Take(3).ToArray(),out _,out _),"Incomplete enrichment roster accepted.");
+                Require(!TrySolve(noRotation,TestMines(n),"",false,out _,out _),"Full-solve API accepted unknown faces.");
+                sequences++;
+            }
+            Require(Cardinal(Vector3.Zero)=="UNKNOWN","Zero vector defaulted to a cardinal.");
+            return $"PASS: {partial} partial-facing cases, {sequences} incremental arrival sequences, unchanged routes/partners, unknown-face guards, contradictions and missing/dead inputs. Offline logic only, NOT live event/render validation.";
+        }
+        catch(Exception e){return "FAIL: "+e.Message;}
+    }
+    private static void Require(bool ok,string why){if(!ok)throw new InvalidOperationException(why);}
+}
